@@ -1,0 +1,26 @@
+# secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# data, audio, indexes and outputs are never committed
+/data/*
+!/data/README.md
+/index/
+/outputs/
+/runs/
+*.mp3
+*.wav
+*.npy
+*.db
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
