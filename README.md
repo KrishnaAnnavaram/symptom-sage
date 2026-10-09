@@ -71,6 +71,7 @@ This README is the **one location that explains all of symptom-sage**. It gives 
 4. 🔄 [The end-to-end workflow](#4-the-end-to-end-workflow)
    - 4.1 [Full flow](#41-full-flow)
    - 4.2 [The life cycle of one question](#42-the-life-cycle-of-one-question)
+   - 4.3 [Who does which step](#43-who-does-which-step)
 5. 🔵 [Transcripts, speech and extraction](#5-transcripts-speech-and-extraction)
 6. 🟢 [Index and retrieval](#6-index-and-retrieval)
 7. 🟣 [The answer step](#7-the-answer-step)
@@ -138,6 +139,59 @@ flowchart LR
 | CLI | `src/symptom_sage/cli.py` | The `symptom-sage` command |
 | App | `src/symptom_sage/app/streamlit_app.py` | Optional Streamlit chat |
 
+The component map shows which module calls which module. An arrow points from the caller to the module that it uses.
+
+```mermaid
+flowchart TB
+    subgraph ENTRY["Entry points"]
+        CLI["cli.py<br/>symptom-sage command"]
+        APP["app/streamlit_app.py<br/>Streamlit chat"]
+    end
+    subgraph INGEST["Ingest"]
+        TR["transcripts.py<br/>load_transcripts"]
+        ASR["asr.py<br/>score_corpus, FasterWhisperTranscriber"]
+        EXT["extraction.py<br/>CaseRecord, RuleExtractor, LLMExtractor"]
+        ST["store.py<br/>write_records, read_records"]
+        SYN["synthetic.py<br/>make_cases"]
+    end
+    subgraph RET["retrieval/"]
+        EMB["embeddings.py<br/>HashingEmbedder, OpenAIEmbedder"]
+        IDX["index.py<br/>LocalIndex, PineconeIndex"]
+        HYB["hybrid.py<br/>HybridRetriever, DenseRetriever"]
+    end
+    subgraph ONLINE["Online answer"]
+        RAG["rag.py<br/>Assistant"]
+        SAF["safety.py<br/>triage, strip_prescriptions"]
+        LLM["llm.py<br/>OpenAIChatLLM, TemplateLLM"]
+    end
+    LEX["lexicon.py<br/>find_symptoms"]
+    EV["evaluate.py<br/>eval_extraction, eval_retrieval,<br/>eval_answers, eval_safety"]
+    CFG["config.py<br/>Settings"]
+
+    CLI --> CFG
+    CLI --> SYN
+    CLI --> TR
+    CLI --> ASR
+    CLI --> EXT
+    CLI --> ST
+    CLI --> RET
+    CLI --> RAG
+    CLI --> EV
+    APP --> CLI
+    EXT --> LLM
+    EXT --> LEX
+    RAG --> SAF
+    RAG --> LLM
+    RAG --> HYB
+    HYB --> IDX
+    HYB --> EMB
+    EV --> RAG
+    EV --> HYB
+    SAF --> LEX
+    EMB --> LEX
+    SYN --> LEX
+```
+
 ### 2.2 System context
 
 ```mermaid
@@ -149,7 +203,7 @@ flowchart TB
     OP["operator"] --> ING["synth / extract / index / eval"]
     ING --> D["data/ (transcripts, cases.jsonl)"]
     ING --> IDX
-    AUD["audio (optional)"] --> W["faster-whisper (optional)"] --> D
+    AUD["audio (optional)"] --> W["faster-whisper (optional)"] --> WER["asr-eval: WER and CER against data/transcripts"]
 ```
 
 ### 2.3 Repository layout
@@ -191,6 +245,19 @@ symptom-sage/
 ### 3.3 No medicine in an answer
 The index document holds no plan. The system prompt forbids medicines. After generation, `strip_prescriptions()` removes each sentence that names a medicine, a dose, a unit such as `mg` or a prescription.
 
+```mermaid
+flowchart LR
+    REC[/"CaseRecord with a plan"/] --> DOC["CaseRecord.document:<br/>assessment, no plan"]
+    DOC --> IDX[("Index")]
+    Q[/"Question"/] --> MR{"is_medication_request?"}
+    MR -- "yes" --> REF[/"medication_refused"/]
+    MR -- "no" --> PR["Prompt: SYSTEM forbids<br/>medicines and doses"]
+    IDX --> PR
+    PR --> LLM["LLM reply"]
+    LLM --> STRIP["strip_prescriptions:<br/>RX_PATTERN, 28 medicine words, doses"]
+    STRIP --> OUT[/"Answer with no medicine sentence"/]
+```
+
 ### 3.4 Citations are checked
 The model must cite cases as `[CASE_ID]`. The assistant removes each citation of a case that was not retrieved and records it in `invalid_citations`.
 
@@ -210,26 +277,63 @@ Speech has WER and extraction has field accuracy. Retrieval has leave-one-case-o
 ### 4.1 Full flow
 
 ```mermaid
-flowchart TB
-    A["audio (optional)"] --> W["faster-whisper"] --> T["transcripts D:/P:"]
+flowchart TD
+    A[/"audio (optional)"/] --> W["faster-whisper"] --> WER[/"asr-eval: WER and CER"/]
+    T[/"transcripts D:/P:"/] --> WER
     T --> X["extract: rules or LLM (JSON, 1 retry)"]
-    X --> V["CaseRecord validation"]
-    V --> C["cases.jsonl"]
+    X --> V{"CaseRecord valid?"}
+    V -- "no, twice" --> FL[("cases.failures.jsonl")]
+    V -- "yes" --> C[("cases.jsonl")]
     C --> E["embed documents (assessment, no plan)"]
-    E --> I["index (upsert by case id)"]
-    Q["question"] --> TR["triage: 10 red flags"]
-    TR -->|"emergency"| EM["fixed emergency message"]
-    TR --> SC["scope + medicine request checks"]
-    SC -->|"refused"| RF["fixed refusal"]
+    E --> I[("index (upsert by case id)")]
+    Q[/"question"/] --> TR{"triage: 10 red flags"}
+    TR -->|"emergency"| EM[/"fixed emergency message"/]
+    TR --> SC{"scope + medicine request checks"}
+    SC -->|"refused"| RF[/"fixed refusal"/]
     SC --> R["BM25 + dense, RRF"]
     I --> R
     R --> P["prompt: question + cases"]
     P --> L["LLM"]
     L --> K["citation check + medicine filter"]
-    K --> OUT["answer + disclaimer"]
+    K --> OUT[/"answer + disclaimer"/]
+    EM --> HUMAN{{"HUMAN<br/>the user contacts a doctor<br/>or the emergency number"}}
+    RF --> HUMAN
+    OUT --> HUMAN
+
+    classDef human fill:#fff3cd,stroke:#b8901f,color:#3d2f00,font-weight:bold
+    class HUMAN human
 ```
 
 ### 4.2 The life cycle of one question
+
+```mermaid
+stateDiagram-v2
+    state "Question" as Q
+    state "Triage done" as Triaged
+    state "Hits retrieved" as Retrieved
+    state "Hits after the score limit" as Filtered
+    state "LLM reply" as Reply
+    state "Checked reply" as Checked
+    [*] --> Q: user asks
+    Q --> Triaged: triage, find_symptoms
+    Triaged --> emergency: red flag with level emergency
+    Triaged --> medication_refused: is_medication_request
+    Triaged --> out_of_scope: no symptom and no medical word
+    Triaged --> Retrieved: retriever.search, top_k
+    Retrieved --> Filtered: keep dense at or above min_score, or BM25 above 0
+    Filtered --> no_match: no hit, level routine
+    Filtered --> urgent: no hit, level urgent, NO_MATCH text
+    Filtered --> Reply: llm.complete
+    Reply --> Checked: remove invalid citations, strip_prescriptions
+    Checked --> urgent: level urgent, urgent message first
+    Checked --> answer: level routine
+    emergency --> [*]
+    medication_refused --> [*]
+    out_of_scope --> [*]
+    no_match --> [*]
+    urgent --> [*]
+    answer --> [*]
+```
 
 1. `triage()` finds the symptoms in the question and applies the red-flag rules.
 2. If the level is `emergency`, the assistant returns the emergency message and the disclaimer. It stops there.
@@ -242,11 +346,103 @@ flowchart TB
 9. For an `urgent` level, the urgent message comes first.
 10. The disclaimer comes last.
 
+### 4.3 Who does which step
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant CLI as symptom-sage CLI
+    participant AS as Assistant
+    participant SAF as safety.py
+    participant RET as HybridRetriever
+    participant IDX as LocalIndex in index/
+    participant LLM as OpenAI-compatible chat
+
+    U->>CLI: symptom-sage ask with the question
+    CLI->>CLI: Settings.from_env, make_embedder
+    CLI->>IDX: LocalIndex.load(index_dir, embedder name)
+    CLI->>AS: answer(question)
+    AS->>SAF: triage, is_medication_request, is_in_scope
+    SAF-->>AS: level routine or urgent, in scope
+    AS->>RET: search(question, k=top_k)
+    RET->>IDX: query(dense vector), plus BM25 scores
+    IDX-->>RET: ranked case ids
+    RET-->>AS: Hit list fused by RRF
+    AS->>AS: drop hits below min_score with no BM25 match
+    AS->>LLM: POST /chat/completions, SYSTEM and question with cases
+    LLM-->>AS: reply with case citations
+    AS->>AS: remove invalid citations
+    AS->>SAF: strip_prescriptions(reply)
+    SAF-->>AS: clean text, removed count
+    AS-->>CLI: Answer with kind, cited, conditions
+    CLI-->>U: answer text, disclaimer, retrieved cases
+```
+
 ---
 
 ## 5. Transcripts, speech and extraction
 
 **Purpose.** Turn interviews into validated case records.
+
+The first diagram shows how `load_transcripts` reads one file.
+
+```mermaid
+flowchart TD
+    IN[/"CASE_ID.txt"/] --> BOM{"UTF-16 byte-order mark?"}
+    BOM -- "yes" --> U16["Decode UTF-16"]
+    BOM -- "no" --> NUL{"More than 1/4<br/>zero bytes?"}
+    NUL -- "yes" --> LE["Decode UTF-16 LE<br/>from the first zero byte"]
+    NUL -- "no" --> U8["Decode UTF-8"]
+    U16 --> CLEAN["Remove BOM and<br/>replacement characters"]
+    LE --> CLEAN
+    U8 --> CLEAN
+    CLEAN --> ID{"Case id like RES0001<br/>with a known prefix?"}
+    ID -- "no" --> ERR[/"ValueError"/]
+    ID -- "yes" --> TURN["Parse D: and P: lines,<br/>other lines continue the last turn"]
+    TURN --> ANY{"Any turn?"}
+    ANY -- "no" --> ERR
+    ANY -- "yes" --> OUT[/"Transcript: case_id,<br/>category, turns"/]
+```
+
+The second diagram shows the two extractors.
+
+```mermaid
+flowchart TD
+    T[/"Transcript"/] --> WHICH{"--extractor"}
+    WHICH -- "rules" --> RA["Age: NN years old,<br/>or the answer to a doctor age question"]
+    RA --> RG["Gender: I am a woman or a man"]
+    RG --> RS["Symptoms: find_symptoms<br/>in patient turns, no negated ones"]
+    RS --> RC["Condition and plan:<br/>patterns in the last doctor text"]
+    RC --> VAL{"CaseRecord valid?"}
+    VAL -- "yes" --> REC[/"CaseRecord"/]
+    VAL -- "no" --> STOP[/"ValidationError:<br/>the command stops"/]
+    WHICH -- "llm" --> CALL["llm.complete:<br/>SYSTEM_PROMPT, JSON mode"]
+    CALL --> LE{"LLMError?"}
+    LE -- "yes" --> FAIL[/"ExtractionFailure"/]
+    LE -- "no" --> PARSE{"JSON object and<br/>CaseRecord valid?"}
+    PARSE -- "yes" --> REC
+    PARSE -- "no, first reply" --> RETRY["Send again with<br/>the error text"]
+    RETRY --> CALL
+    PARSE -- "no, second reply" --> FAIL
+    REC --> W[("cases.jsonl")]
+    FAIL --> WF[("cases.failures.jsonl")]
+```
+
+The third diagram shows the speech evaluation, `asr-eval`.
+
+```mermaid
+flowchart LR
+    REF[/"--ref-dir<br/>reference transcripts"/] --> PAIR["Pair by case id"]
+    AUD[/"--audio-dir .mp3"/] --> FW["FasterWhisperTranscriber<br/>language en, VAD filter"]
+    FW --> SAVE[("--save-dir<br/>new transcripts")]
+    FW --> PAIR
+    HYP[/"--hyp-dir .txt"/] --> PAIR
+    PAIR --> NORM["normalize_for_wer: speaker tags,<br/>case, punctuation, fillers"]
+    NORM --> ED["edit_distance<br/>words and characters"]
+    ED --> POOL["Pooled WER for each<br/>category and ALL"]
+    POOL --> OUT[/"JSON: n, pooled_wer, mean_cer"/]
+```
 
 | Input | Output |
 |---|---|
@@ -283,6 +479,40 @@ flowchart TB
 
 **Purpose.** Store case documents and find the most similar cases for a question.
 
+The first diagram shows the `index` command.
+
+```mermaid
+flowchart TD
+    IN[("cases.jsonl")] --> RD["read_records: schema check,<br/>no duplicate case_id"]
+    RD --> USE{"Record has<br/>a condition?"}
+    USE -- "no" --> SKIP["Not indexed"]
+    USE -- "yes" --> DOC["case_doc: document text,<br/>category, condition, symptoms"]
+    DOC --> EMB{"SYMPTOM_SAGE_EMBEDDER"}
+    EMB -- "hashing" --> HE["HashingEmbedder: 1-2 grams<br/>+ SYM_ tokens, 4096 dims"]
+    EMB -- "openai" --> OE["OpenAIEmbedder:<br/>batches of 256"]
+    HE --> BK{"SYMPTOM_SAGE_INDEX_BACKEND"}
+    OE --> BK
+    BK -- "local" --> LI["LocalIndex.upsert:<br/>replace a known case id"]
+    LI --> SV[("index/vectors.npy<br/>index/docs.json")]
+    BK -- "pinecone" --> PI["PineconeIndex.upsert:<br/>batches of 100, document in metadata"]
+    PI --> PC[("Pinecone index")]
+```
+
+The second diagram shows `HybridRetriever.search`.
+
+```mermaid
+flowchart LR
+    Q[/"Question"/] --> EQ["embedder.embed"]
+    EQ --> DQ["LocalIndex.query:<br/>cosine over all cases"]
+    Q --> BQ["BM25.scores: tokens<br/>+ sym_ tokens"]
+    DQ --> DR["Dense rank"]
+    BQ --> BR["BM25 rank,<br/>only scores above 0"]
+    DR --> RRF["Sum of 1 / (60 + rank)"]
+    BR --> RRF
+    RRF --> TOP["Sort, take top k"]
+    TOP --> OUT[/"Hit: case_id, score,<br/>dense, bm25, doc"/]
+```
+
 | Input | Output |
 |---|---|
 | Case records, a question | `Hit` list: case id, fused score, dense score, BM25 score, document |
@@ -307,6 +537,25 @@ flowchart TB
 
 **Purpose.** Write a short answer from the retrieved cases only.
 
+```mermaid
+flowchart TD
+    IN[/"Question and hits<br/>after the score limit"/] --> BP["build_prompt: USER_TEMPLATE<br/>question + case documents"]
+    BP --> WHICH{"SYMPTOM_SAGE_LLM"}
+    WHICH -- "fake" --> TL["TemplateLLM: list the<br/>assessments with citations"]
+    WHICH -- "openai" --> OL["OpenAIChatLLM:<br/>temperature 0, seed 7"]
+    OL --> ERR{"LLMError?"}
+    ERR -- "yes" --> FB["Reply: the answer service failed,<br/>talk with a doctor"]
+    ERR -- "no" --> CIT
+    TL --> CIT["Find the CASE_ID citations"]
+    FB --> CIT
+    CIT --> INV{"Cited case not<br/>retrieved?"}
+    INV -- "yes" --> RM["Remove it, add to<br/>invalid_citations"]
+    INV -- "no" --> STRIP
+    RM --> STRIP["strip_prescriptions"]
+    STRIP --> COND["conditions from the<br/>valid cited cases"]
+    COND --> OUT[/"Answer: prefix + text<br/>+ DISCLAIMER"/]
+```
+
 | Input | Output |
 |---|---|
 | Question, hits | `Answer`: text, triage, kind, cited ids, conditions, retrieved list, removed sentences, invalid citations |
@@ -330,6 +579,21 @@ flowchart TB
 
 ## 8. The safety model
 
+The diagram shows how `triage` gives the level of one question.
+
+```mermaid
+flowchart TD
+    Q[/"Question"/] --> FS["find_symptoms: lexicon<br/>aliases, 40 symptoms"]
+    FS --> NEG{"Negation word in the<br/>4 words before?"}
+    NEG -- "yes" --> DROP["Symptom not counted"]
+    NEG -- "no" --> SYM["Symptom set"]
+    SYM --> RF["For each of the 10 RedFlag rules:<br/>all of all_of, and one of any_of"]
+    RF --> HIT{"Any rule matches?"}
+    HIT -- "no" --> ROU[/"routine"/]
+    HIT -- "yes" --> EMQ{"Any match with<br/>level emergency?"}
+    EMQ -- "yes" --> EME[/"emergency: message of<br/>the emergency rules"/]
+    EMQ -- "no" --> URG[/"urgent: message of<br/>the urgent rules"/]
+```
 | Red flag | Rule (symptoms in the question) | Level |
 |---|---|---|
 | possible heart attack | `chest pain` and one of `sweating`, `shortness of breath`, `fainting`, `dizziness` | `emergency` |
@@ -433,6 +697,24 @@ streamlit run src/symptom_sage/app/streamlit_app.py
 | `symptom-sage asr-eval` | WER and CER from audio or from existing transcripts |
 | `symptom-sage demo` | The full offline workflow |
 
+The diagram shows the order of the commands and the files that connect them.
+
+```mermaid
+flowchart LR
+    SYN["symptom-sage synth"] --> ST[("data/synthetic/transcripts<br/>data/synthetic/truth.jsonl")]
+    PUB[/"Public dataset<br/>data/transcripts"/] --> EXT
+    ST --> EXT["symptom-sage extract"]
+    EXT --> CJ[("data/cases.jsonl")]
+    CJ --> IDX["symptom-sage index"]
+    IDX --> IX[("index/")]
+    IX --> ASK["symptom-sage ask or chat"]
+    IX --> APP["streamlit run<br/>streamlit_app.py"]
+    CJ --> EV["symptom-sage eval"]
+    ST -- "truth.jsonl" --> EV
+    PUB --> ASR["symptom-sage asr-eval"]
+    DEMO["symptom-sage demo<br/>all steps in one folder"]
+```
+
 ### 10.4 Environment variables
 
 | Variable | Used by | Meaning |
@@ -451,7 +733,16 @@ streamlit run src/symptom_sage/app/streamlit_app.py
 | `SYMPTOM_SAGE_MIN_SCORE` | Retrieval | Minimum dense score when BM25 has no match. Default 0.05 |
 | `SYMPTOM_SAGE_WHISPER_MODEL` | ASR | Default `base` |
 
-Credentials are only in a local `.env` file. Git ignores this file. Do not print or commit credentials.
+symptom-sage reads only the process environment. It does not read a `.env` file. Keep credentials in a local `.env` file (git ignores this file) and load it into the shell before you run a command. Do not print or commit credentials.
+
+```mermaid
+flowchart LR
+    ENV[/".env file, loaded<br/>into the shell"/] --> PENV[/"Process environment"/]
+    PENV --> FE["Settings.from_env:<br/>empty value gives the default"]
+    FE --> CHK{"LLM fake or openai, EMBEDDER hashing or openai,<br/>INDEX_BACKEND local or pinecone, TOP_K 1 or more?"}
+    CHK -- "yes" --> SET[/"Settings, keys hidden in repr"/]
+    CHK -- "no" --> ERR[/"ValueError: the CLI prints<br/>error: and returns 2"/]
+```
 
 ---
 
@@ -470,6 +761,23 @@ Credentials are only in a local `.env` file. Git ignores this file. Do not print
 ---
 
 ## 12. Validation results
+
+The diagram shows how `symptom-sage demo` and `symptom-sage eval` make the numbers in the table.
+
+```mermaid
+flowchart TD
+    SYN["make_cases: 8 for each of<br/>12 conditions, seed 21"] --> RX["RuleExtractor"]
+    SYN --> TRU[("truth.jsonl")]
+    RX --> REC["96 CaseRecords"]
+    REC --> EX["eval_extraction:<br/>field accuracy, symptom F1"]
+    TRU --> EX
+    REC --> RT["eval_retrieval: leave one case out,<br/>hit@1, 3, 5 and chance"]
+    REC --> SH["split_half: by condition"]
+    SH --> AN["eval_answers: index half,<br/>ask with the other half"]
+    AN --> AM[/"condition_in_answer, valid_citations,<br/>medicine_leaks"/]
+    REC --> SF["eval_safety:<br/>22 prompts in redteam.json"]
+    SF --> SM[/"expected answer kind,<br/>pass rate"/]
+```
 
 | Validation | Result | Command |
 |---|---|---|
